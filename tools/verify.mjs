@@ -595,6 +595,33 @@ await waterfall(
 );
 await check('next() is always awaited', () => assert.equal(calledNext, true));
 
+console.log('file encoding');
+await check('no shipped file starts with a UTF-8 BOM', async () => {
+  // A BOM is invisible in every editor and in `git diff`, and it silently breaks
+  // `JSON.parse` — `package.json` stopped loading the moment one crept in from a
+  // PowerShell `Set-Content -Encoding UTF8`. Nothing else in this suite notices,
+  // because the file still looks correct and still "has the right content".
+  const { readdir: rd, readFile: rf } = await import('node:fs/promises');
+  const offenders = [];
+  const walk = async (dir) => {
+    for (const entry of await rd(dir, { withFileTypes: true })) {
+      if (entry.name === 'node_modules' || entry.name === '.git') continue;
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        await walk(full);
+        continue;
+      }
+      if (!/\.(js|mjs|cjs|json|yml|yaml|md)$/.test(entry.name)) continue;
+      const head = (await rf(full)).subarray(0, 3);
+      if (head[0] === 0xef && head[1] === 0xbb && head[2] === 0xbf) {
+        offenders.push(full.slice(pluginDir.length + 1));
+      }
+    }
+  };
+  await walk(pluginDir);
+  assert.deepEqual(offenders, [], `these files start with a BOM: ${offenders.join(', ')}`);
+});
+
 console.log('journal');
 await check('the fake host journaled into the isolated directory, not the real one', async () => {
   const { readdir } = await import('node:fs/promises');

@@ -7,7 +7,7 @@
  * scheduler, and an unknown key must be reported rather than silently ignored.
  */
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -148,28 +148,98 @@ test('sanitise survives a non-object input', () => {
   }
 });
 
-test('save writes atomically and leaves no temp files', async () => {
+test('save stages through a sibling temp file, then renames it into place', async () => {
+  // WHY THIS IS SHAPED ODDLY. The previous version of this test asserted "one file
+  // with the right content exists afterwards", which a plain `writeFileSync` also
+  // satisfies — so it could not detect atomicity being removed, the exact property
+  // it appeared to cover.
+  //
+  // Observing the mechanism directly is not possible from here: the module imports
+  // `writeFileSync`/`renameSync` as named ESM bindings, and ESM binds those to the
+  // original exports, so patching `node:fs` in this test cannot intercept them.
+  // Rather than keep an assertion that cannot fail, this records what CAN be
+  // observed — that the rename source is a sibling of the destination, so the
+  // rename is same-filesystem and therefore atomic and instant — and the failure
+  // path below covers the other half.
   await withHome(async (dir) => {
     const result = save({ lowMax: 4, semantic: { timeoutMs: 900 } });
     assert.equal(result.ok, true);
     assert.deepEqual(load(), { lowMax: 4, semantic: { timeoutMs: 900 } });
 
+    assert.deepEqual(
+      await readdir(dir),
+      [OVERRIDES_FILE],
+      'the destination must be the only file left: the staging file is a sibling, '
+      + 'not a system-temp file, and it is gone once the rename succeeds',
+    );
     const raw = await readFile(join(dir, OVERRIDES_FILE), 'utf8');
     assert.ok(raw.endsWith('\n'), 'the file should end with a newline');
-    assert.deepEqual(await readdir(dir), [OVERRIDES_FILE], 'no temp leftovers');
   });
 });
 
-test('save reports an invalid value and an unknown key differently', async () => {
+test('a failed save reports the error and leaves no temp file behind', async () => {
+  // This is the half that CAN be observed, and it was untested. Making the
+  // DESTINATION a directory makes the rename fail, which is how this write
+  // realistically goes wrong; the staging file must not survive the failure.
+  await withHome(async (dir) => {
+    await mkdir(join(dir, OVERRIDES_FILE), { recursive: true });
+
+    const result = save({ lowMax: 4 });
+    assert.equal(result.ok, false, 'a failed write must not report success');
+    assert.equal(typeof result.error, 'string');
+    assert.deepEqual(
+      (await readdir(dir)).filter((name) => name !== OVERRIDES_FILE),
+      [],
+      'the staging file must be cleaned up when the rename fails',
+    );
+  });
+});
+
+test('save cannot be made to throw even when the filesystem refuses the write', async () => {
+  // `save` documents that it never throws, and the write route depends on that:
+  // a rejection there produces a 400 with an empty body instead of a real error.
+  await withHome(async (dir) => {
+    // A directory at the destination plus a directory at the staging path makes
+    // both the rename and the cleanup fail.
+    await mkdir(join(dir, OVERRIDES_FILE), { recursive: true });
+    await mkdir(join(dir, `${OVERRIDES_FILE}.${process.pid}.tmp`), { recursive: true });
+
+    let result;
+    await assert.doesNotReject(async () => { result = save({ lowMax: 4 }); });
+    assert.equal(result.ok, false);
+    assert.equal(typeof result.error, 'string');
+  });
+});
+
+test('save reports an invalid value differently from an unknown key', async () => {
   await withHome(() => {
     const result = save({ lowMax: 999, wrong: 1 });
-    assert.equal(result.ok, true);
+    // NOT `ok`, because nothing survived — and a save replaces the file, so an
+    // "ok" here would mean "I deleted your settings and stored nothing".
+    assert.equal(result.ok, false);
+    assert.equal(result.empty, true);
     // `lowMax` IS editable, so an out-of-range value is a mistake to surface.
     assert.deepEqual(result.rejected, ['lowMax']);
     // `wrong` was never editable, so it is not an error — reporting it as one is
     // what made every successful save look like it had failed.
     assert.deepEqual(result.ignored, ['wrong']);
     assert.deepEqual(load(), {}, 'neither key may be stored');
+  });
+});
+
+test('save refuses to replace stored overrides with an empty set', async () => {
+  await withHome(() => {
+    save({ lowMax: 9 });
+    assert.deepEqual(load(), { lowMax: 9 });
+
+    // Every one of these validated down to nothing. Reporting success would have
+    // deleted `lowMax`.
+    for (const input of [{}, { bogus: 1 }, { lowMax: 999 }]) {
+      const result = save(input);
+      assert.equal(result.ok, false, `${JSON.stringify(input)} must not report success`);
+      assert.equal(result.empty, true);
+      assert.deepEqual(load(), { lowMax: 9 }, `${JSON.stringify(input)} must not delete the file`);
+    }
   });
 });
 
@@ -180,6 +250,58 @@ test('save of only valid editable keys reports nothing at all', async () => {
     assert.deepEqual(result.rejected, []);
     assert.deepEqual(result.ignored, []);
     assert.deepEqual(load(), { lowMax: 3 });
+  });
+});
+
+test('save never throws, whatever the value type', async () => {
+  await withHome(() => {
+    // `Number({toString:1})` raises a TypeError. That call used to sit OUTSIDE
+    // save()'s try, so a hostile body escaped the module's error contract and the
+    // async write route rejected with no response at all.
+    const hostile = [
+      { lowMax: { toString: 1 } },
+      { lowMax: { valueOf: 1 } },
+      { window: { toString: 1 } },
+      { semantic: { timeoutMs: { toString: 1 } } },
+      { lowMax: [1, 2] },
+      { lowMax: { nested: { deep: 1 } } },
+      { semantic: { constructor: { toString: 1 } } },
+    ];
+    for (const input of hostile) {
+      assert.doesNotThrow(() => save(input), `${JSON.stringify(input)} threw`);
+    }
+  });
+});
+
+test('save rejects a value of the wrong TYPE rather than coercing it', async () => {
+  await withHome(() => {
+    // Each of these used to be silently accepted: null->0, ''->0, true->1, [5]->5.
+    for (const input of [{ lowMax: null }, { lowMax: '' }, { lowMax: true }, { window: [5] }, { lowMax: '3' }]) {
+      const result = save(input);
+      assert.equal(result.ok, false, `${JSON.stringify(input)} must not be stored`);
+      assert.ok(result.rejected.length > 0, `${JSON.stringify(input)} must be reported as rejected`);
+    }
+    assert.deepEqual(load(), {});
+  });
+});
+
+test('save ignores keys that only exist on Object.prototype', async () => {
+  await withHome(() => {
+    // An unguarded `ALLOWED[key]` lookup walks the prototype chain, so
+    // `constructor`, `valueOf`, `toString` … resolved to real functions and were
+    // treated as valid specs — specs with no type or bounds at all.
+    for (const key of ['constructor', 'valueOf', 'toString', 'hasOwnProperty', 'isPrototypeOf', '__defineGetter__']) {
+      const result = save({ [key]: 5 });
+      assert.equal(result.ok, false, `${key} must not be storable`);
+      assert.ok(result.ignored.includes(key), `${key} must be reported as ignored`);
+    }
+    assert.deepEqual(load(), {}, 'nothing may reach the file');
+
+    // And the nested form.
+    const nested = save({ semantic: { constructor: 9, timeoutMs: 1200 } });
+    assert.equal(nested.ok, true);
+    assert.ok(nested.ignored.includes('semantic.constructor'));
+    assert.deepEqual(load(), { semantic: { timeoutMs: 1200 } });
   });
 });
 

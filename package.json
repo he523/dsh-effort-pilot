@@ -38,8 +38,9 @@
     }
   },
   "scripts": {
+    "pretest": "node tools/sync.mjs",
     "test": "node --test \"tests/*.test.js\"",
-    "test:unit": "node --test tests/decide.test.js tests/session-events.test.js tests/scorer.test.js tests/journal.test.js tests/publish-state.test.js tests/chip-server.test.js",
+    "test:unit": "node --test tests/decide.test.js tests/session-events.test.js tests/scorer.test.js tests/journal.test.js tests/publish-state.test.js tests/chip-server.test.js tests/config-overrides.test.js",
     "test:plugin": "node tools/sync.mjs && node --test tests/plugin.test.js",
     "sync": "node tools/sync.mjs",
     "verify": "node tools/sync.mjs && node --test tests/plugin.test.js && node tools/verify.mjs"
