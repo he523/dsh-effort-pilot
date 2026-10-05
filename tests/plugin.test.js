@@ -120,8 +120,13 @@ test('apply registers the routes the client half reads and prepends the waterfal
 
     assert.deepEqual(
       registeredRoutes.sort(),
-      ['/dsh-effort/report.json', '/dsh-effort/state.json', '/dsh-effort/status.json'].sort(),
-      'the routes the client half reads must be registered on activation',
+      [
+        '/dsh-effort/config.json',
+        '/dsh-effort/report.json',
+        '/dsh-effort/state.json',
+        '/dsh-effort/status.json',
+      ].sort(),
+      'every route the client half reads must be registered on activation',
     );
 
     // `{prepend: true}` is what makes this plugin decide BEFORE the built-in

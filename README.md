@@ -205,6 +205,51 @@ ever needed again:
 
 `chip: false` disables all of it — no state written, no routes, no chip.
 
+## Settings card
+
+The client half also registers a `settings.section`, so the thresholds can be
+changed from **Settings** instead of by editing `cordis.patch.yml` and restarting.
+
+It exposes the thresholds, the sampling controls, the behaviour switches, and a
+read-only readout of the last decision plus the distribution of what the judge has
+actually been returning — a threshold is only worth moving against that
+distribution rather than against a guess. Bar colours follow the thresholds you
+have entered, so nudging `lowMax` visibly re-colours the histogram.
+
+### Where an edit is stored
+
+Not in `cordis.patch.yml`. That file belongs to DSH, has no host service for
+writing it, and rewriting it to persist a UI edit would risk its comments and
+formatting. The effective configuration is layered instead:
+
+| Layer | Source | Wins |
+|---|---|---|
+1 | schema defaults (`Config` in `lib/index.js`) | lowest |
+2 | the profile patch | |
+3 | `$DSH_HOME/.dsh-effort-pilot.config.json` | **highest** |
+
+Layer 3 is written only by the card, and the card's **restore** button deletes the
+whole file — so an override layer can always be dropped, returning the plugin to
+exactly what the profile declares. Changes apply to the next decision, because the
+host re-reads the overrides on every call rather than capturing them at startup.
+
+Only whitelisted keys are accepted (`lib/config-overrides.js`), and every value is
+type- and range-checked **both on save and on load** — the file is user-writable,
+so a hand-edited nonsense threshold must not be able to reach the scheduler. A key
+the card does not know about is reported back to the UI rather than silently
+dropped, so a typo surfaces instead of appearing to save.
+
+```
+GET  /dsh-effort/config.json   live values, declared baseline, observations
+POST /dsh-effort/config.json   persist a change, or {"reset": true}
+```
+
+Both are loopback-only. This is the plugin's only **writable** route, so the guard
+matters more here than anywhere else: without it, anything on the LAN could change
+how the scheduler behaves.
+
+`chip: false` disables the card along with the chip, since both need the routes.
+
 ### Runtime diagnostics
 
 The client half can fail silently just as the script could: a bundle that does not

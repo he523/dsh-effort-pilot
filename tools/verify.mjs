@@ -94,10 +94,14 @@ await check('the client bundle applies cleanly against a fake loader', async () 
   let loaded;
   const fakeReact = {
     createElement: (...args) => ({ args }),
-    // Return a stable slot, and RUN effects on the spot so the mount beacon and
-    // the state poll are both exercised rather than merely declared.
-    useState: () => [null, () => {}],
-    useEffect: (fn) => { try { fn(); } catch { /* the component guards itself */ } },
+    // A faithful-enough `useState`: it must return the INITIAL value, not null.
+    // Returning null made the settings card throw on `snapshot.data`, and a stub
+    // that breaks a component the real React would render is a stub that hides
+    // component bugs rather than exposing them.
+    useState: (initial) => [initial, () => {}],
+    // RUN effects on the spot so the mount beacons and the config fetch are both
+    // exercised rather than merely declared.
+    useEffect: (fn) => { try { fn(); } catch { /* the components guard themselves */ } },
   };
   const fetched = [];
   // Stub the timers: the component starts a real interval, which would keep this
@@ -135,15 +139,22 @@ await check('the client bundle applies cleanly against a fake loader', async () 
   assert.equal(mod.name, 'dsh-effort-pilot');
   assert.equal(typeof mod.apply, 'function');
 
-  // Applying must register exactly one entry, in the composer slot.
+  // The client half registers TWO surfaces, and each is wrapped in its own
+  // try/catch so a host missing one seat still gets the other. That robustness
+  // also means a throwing FAKE would be silently swallowed and the surface would
+  // simply not appear — which is exactly how a "one slot entry" assertion kept
+  // passing after the settings card was added. So the fake records the asked-for
+  // slot and dispatches; it must accept both names, and the assertions below
+  // require both to have registered.
   const registrations = [];
+  const askedSlots = [];
   const ctx = {
     inject(services, cb) {
       assert.ok(services.includes('slots'), 'the client half needs the core slots service');
       cb({
         slots: {
           inject(slot, fn) {
-            assert.equal(slot, 'conversation.input.right');
+            askedSlots.push(slot);
             return fn();
           },
           register(config, component) {
@@ -155,14 +166,31 @@ await check('the client bundle applies cleanly against a fake loader', async () 
     },
   };
   assert.doesNotThrow(() => mod.apply(ctx));
-  assert.equal(registrations.length, 1, `expected one slot entry, got ${registrations.length}`);
-  assert.equal(registrations[0].config.name, 'conversation.input.right');
-  assert.equal(typeof registrations[0].component, 'function', 'the entry must be a component');
 
-  // Render once. This must poll the state route AND announce the mount, because
+  const byName = (name) => registrations.filter((r) => r.config.name === name);
+  assert.deepEqual(
+    askedSlots.sort(),
+    ['conversation.input.right', 'settings.section'],
+    `the client half must ask for both seats, asked: ${askedSlots.join(', ')}`,
+  );
+  assert.equal(registrations.length, 2, `expected two slot entries, got ${registrations.length}`);
+
+  const chip = byName('conversation.input.right')[0];
+  assert.ok(chip, 'the composer chip must register');
+  assert.equal(typeof chip.component, 'function', 'the chip entry must be a component');
+  assert.equal(chip.config.id, 'effort-pilot-level');
+
+  const card = byName('settings.section')[0];
+  assert.ok(card, 'the settings card must register');
+  assert.equal(typeof card.component, 'function', 'the settings entry must be a component');
+  assert.equal(card.config.id, 'effort-pilot');
+  assert.equal(typeof card.config.label, 'function', 'a settings section needs a label');
+  assert.equal(typeof card.config.label(), 'string');
+
+  // Rendering the chip must poll the state route AND announce the mount, because
   // the beacon is the host's only evidence that the client half is alive — a
   // route nobody calls would be dead code that only looks like observability.
-  assert.doesNotThrow(() => registrations[0].component());
+  assert.doesNotThrow(() => chip.component());
   assert.ok(
     fetched.some((u) => u.startsWith('/dsh-effort/state.json')),
     `the chip must poll the published state, fetched: ${fetched.join(', ') || '(nothing)'}`,
@@ -170,6 +198,14 @@ await check('the client bundle applies cleanly against a fake loader', async () 
   assert.ok(
     fetched.some((u) => u.startsWith('/dsh-effort/report.json')),
     `the chip must announce its mount, fetched: ${fetched.join(', ') || '(nothing)'}`,
+  );
+
+  // And the card must read the settings route, or it would render nothing while
+  // looking like a working panel.
+  assert.doesNotThrow(() => card.component());
+  assert.ok(
+    fetched.some((u) => u.startsWith('/dsh-effort/config.json')),
+    `the card must read the settings route, fetched: ${fetched.join(', ') || '(nothing)'}`,
   );
 });
 
@@ -426,6 +462,7 @@ await check('the chip routes are registered by apply()', async () => {
   mod.apply(ctx, value);
   for (const expected of [
     '/dsh-effort/state.json',
+    '/dsh-effort/config.json',
     '/dsh-effort/report.json',
     '/dsh-effort/status.json',
   ]) {
@@ -435,6 +472,9 @@ await check('the chip routes are registered by apply()', async () => {
   // avoid throwing. Without `req.socket` the guard sees a non-loopback peer and
   // returns 403 — so the earlier version of this loop exercised only the refusal
   // path and never the body.
+  //
+  // AWAITED, because the settings route's handler is async: asserting
+  // synchronously would read an empty response and pass for the wrong reason.
   for (const route of routes) {
     const res = {
       status: 0,
@@ -442,9 +482,9 @@ await check('the chip routes are registered by apply()', async () => {
       writeHead(status) { res.status = status; },
       end(body) { res.body = body; },
     };
-    assert.doesNotThrow(
-      () => route.handler({ url: '/', socket: { remoteAddress: '127.0.0.1' } }, res),
-      `${route.path} handler threw`,
+    await assert.doesNotReject(
+      async () => route.handler({ url: '/', method: 'GET', socket: { remoteAddress: '127.0.0.1' } }, res),
+      `${route.path} handler rejected`,
     );
     assert.equal(res.status, 200, `${route.path} must answer a loopback caller`);
     assert.equal(typeof res.body, 'string', `${route.path} must write a body`);
