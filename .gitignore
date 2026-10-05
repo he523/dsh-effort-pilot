@@ -1,0 +1,13 @@
+# Runtime and generated files
+node_modules/
+*.log
+*.tmp
+
+# Plugin runtime state (written by the host at run time, never committed)
+.dsh-effort-state.json
+.dshw-*.json
+effort-pilot.log
+
+# Tooling caches
+.cache/
+*.tsbuildinfo

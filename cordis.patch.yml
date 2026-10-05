@@ -1,0 +1,8 @@
+# Bundle layer for dsh-effort-pilot.
+#
+# Inserted as one loader row. The plugin reads its configuration from this
+# profile's `cordis.patch.yml` (a later patch layer with the same id overrides
+# the defaults), or from the plugin settings card for the volatile fields.
+- insert:
+    - id: effort-pilot
+      name: dsh-effort-pilot

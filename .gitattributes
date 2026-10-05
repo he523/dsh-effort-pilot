@@ -1,0 +1,13 @@
+# Keep line endings stable across platforms.
+#
+# Without this, Git on Windows converts LF to CRLF in the working tree, so every
+# checkout reports hundreds of modifications that are pure line-ending noise —
+# and a diff review becomes useless.
+* text=auto eol=lf
+
+# Binary assets must never be normalised.
+*.png binary
+*.jpg binary
+*.gif binary
+*.wav binary
+*.mp3 binary
