@@ -303,7 +303,8 @@ test('the settings route persists a valid write and reloads the overrides', asyn
     assert.equal(res.status, 200);
     const body = res.json();
     assert.equal(body.ok, true);
-    assert.deepEqual(body.rejected, ['bogus'], 'an unknown key must be REPORTED, not ignored');
+    assert.deepEqual(body.rejected, [], 'no editable value was invalid here');
+    assert.deepEqual(body.ignored, ['bogus'], 'an unmanaged key is IGNORED, never reported as rejected');
     assert.deepEqual(body.values, { lowMax: 4 });
     assert.equal(reloads, 1, 'the running config must be refreshed immediately');
 

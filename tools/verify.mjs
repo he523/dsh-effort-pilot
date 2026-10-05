@@ -92,30 +92,165 @@ await check('the client bundle applies cleanly against a fake loader', async () 
   const source = await rf(join(pluginDir, './lib/client.js'), 'utf8');
 
   let loaded;
+  /**
+   * The settings-route payload the fake host serves.
+   *
+   * `effective` deliberately includes a group (`weights`) that the card does NOT
+   * manage, because that is what the real route returns. The card used to POST the
+   * whole thing, so the host reported all six weights keys as "rejected" on every
+   * successful save. That regression is what the assertions below now catch.
+   */
+  const CONFIG_FIXTURE = {
+    effective: {
+      enabled: true, mode: 'hybrid', lowMax: 3, highMin: 6, window: 8,
+      allowDowngrade: true, allowUpgrade: true, respectManual: true,
+      advertiseAuto: true, journal: true, chip: true,
+      confirmRounds: 2, minDwellTurns: 1,
+      weights: { retryRatio: 6, errorRatio: 5, rereadRatio: 2, payloadTrend: 3, toolDiversity: 1, contextPressure: 4 },
+      semantic: {
+        enabled: true, provider: 'zhipu', model: 'glm-4-flash', timeoutMs: 2500,
+        resampleDecisions: 12, maxCallsPerSession: 100,
+      },
+    },
+    // Realistic spec shapes, not `{}`: the card iterates these objects, and an
+    // empty object would keep passing even if the host started publishing
+    // something the card cannot read.
+    editable: {
+      enabled: { type: 'boolean' },
+      mode: { type: 'enum', values: ['local', 'hybrid'] },
+      lowMax: { type: 'number', min: 0, max: 10, integer: true },
+      highMin: { type: 'number', min: 0, max: 10, integer: true },
+      allowDowngrade: { type: 'boolean' },
+      allowUpgrade: { type: 'boolean' },
+      respectManual: { type: 'boolean' },
+      advertiseAuto: { type: 'boolean' },
+      chip: { type: 'boolean' },
+      journal: { type: 'boolean' },
+      window: { type: 'number', min: 1, max: 64, integer: true },
+      confirmRounds: { type: 'number', min: 1, max: 32, integer: true },
+      minDwellTurns: { type: 'number', min: 0, max: 100, integer: true },
+    },
+    editableNested: {
+      semantic: {
+        enabled: { type: 'boolean' },
+        model: { type: 'string', maxLength: 64 },
+        resampleDecisions: { type: 'number', min: 1, max: 1000, integer: true },
+        timeoutMs: { type: 'number', min: 250, max: 30000, integer: true },
+        maxCallsPerSession: { type: 'number', min: 0, max: 100000, integer: true },
+        ambiguousLow: { type: 'number', min: 0, max: 10, integer: true },
+        ambiguousHigh: { type: 'number', min: 0, max: 10, integer: true },
+      },
+    },
+  };
+  // A minimal but FAITHFUL react: it keeps state across re-renders, so a
+  // component that only becomes renderable after new state arrives (the settings
+  // card, which starts "loading" and then shows the form) actually gets there.
+  // The earlier stub returned `initial` and never updated, which meant the card's
+  // loaded branch — and the payload its save button builds — was never exercised.
+  // Hooks are stored PER COMPONENT. A single shared array looks like it works
+  // until two components render, at which point each consumes the other's slots —
+  // which is exactly what happened here, and it is not a mistake real React can
+  // make. Keeping a map keyed by the component being rendered mirrors real React
+  // closely enough that a broken component actually fails.
+  const hookStore = new Map();
+  const effectStore = new Map();
+  let currentComponent = null;
+  let hookCursor = 0;
+
+  const renderComponent = (component) => {
+    currentComponent = component;
+    hookCursor = 0;
+    return component();
+  };
+
+  const depsChanged = (previous, next) => {
+    if (previous === undefined) return true;
+    if (!previous || !next || previous.length !== next.length) return true;
+    for (let i = 0; i < previous.length; i += 1) {
+      if (!Object.is(previous[i], next[i])) return true;
+    }
+    return false;
+  };
+
   const fakeReact = {
-    createElement: (...args) => ({ args }),
-    // A faithful-enough `useState`: it must return the INITIAL value, not null.
-    // Returning null made the settings card throw on `snapshot.data`, and a stub
-    // that breaks a component the real React would render is a stub that hides
-    // component bugs rather than exposing them.
-    useState: (initial) => [initial, () => {}],
-    // RUN effects on the spot so the mount beacons and the config fetch are both
-    // exercised rather than merely declared.
-    useEffect: (fn) => { try { fn(); } catch { /* the components guard themselves */ } },
+    createElement: (type, props, ...children) => ({ type, props: props || {}, children }),
+    useState: (initial) => {
+      const store = hookStore.get(currentComponent) || [];
+      hookStore.set(currentComponent, store);
+      const slot = hookCursor;
+      hookCursor += 1;
+      if (store[slot] === undefined) store[slot] = initial;
+      const set = (next) => {
+        store[slot] = typeof next === 'function' ? next(store[slot]) : next;
+        if (currentComponent) renderComponent(currentComponent);
+      };
+      return [store[slot], set];
+    },
+    /**
+     * Honour the DEPENDENCY ARRAY.
+     *
+     * Running every effect on every render is not "close enough": the config fetch
+     * sets state, the render runs the effect again, the fetch fires again — an
+     * infinite loop that exhausted the heap instead of reporting a failure. A stub
+     * must reproduce the semantics the component relies on, or it manufactures
+     * bugs the real runtime cannot have.
+     */
+    useEffect: (fn, deps) => {
+      const store = effectStore.get(currentComponent) || [];
+      effectStore.set(currentComponent, store);
+      const slot = hookCursor;
+      hookCursor += 1;
+      const previous = store[slot];
+      if (!depsChanged(previous, deps)) return;
+      store[slot] = deps ? [...deps] : undefined;
+      try { fn(); } catch { /* the components guard themselves */ }
+    },
   };
   const fetched = [];
+  /** Bodies of any POST to the settings route. */
+  const posted = [];
   // Stub the timers: the component starts a real interval, which would keep this
   // process alive forever. The first poll still runs, which is what is asserted.
   const stoppedIntervals = [];
+  /** The most recent render output. */
+  let host = null;
+  /** Answer each route with a realistic payload. */
+  const respondTo = (url) => {
+    if (String(url).startsWith('/dsh-effort/config.json')) {
+      return {
+        ok: true,
+        effective: CONFIG_FIXTURE.effective,
+        declared: {},
+        overrides: {},
+        editable: CONFIG_FIXTURE.editable,
+        editableNested: CONFIG_FIXTURE.editableNested,
+        observations: {},
+      };
+    }
+    return { ok: false };
+  };
   const sandbox = {
     window: { __ModuleLoader__: { load: (entry) => { loaded = entry; } } },
     require: (name) => {
       if (name === 'react') return fakeReact;
       throw new Error(`unexpected require: ${name}`);
     },
-    fetch: (url) => {
+    fetch: (url, options) => {
       fetched.push(String(url));
-      return Promise.resolve({ json: () => Promise.resolve({ ok: false }) });
+      if (options && String(options.method).toUpperCase() === 'POST') {
+        posted.push({ url: String(url), body: JSON.parse(String(options.body)) });
+      }
+      // Resolve SYNCHRONOUSLY-ish, then re-render: the card only builds its form
+      // once the config payload has arrived.
+      const payload = respondTo(url);
+      return Promise.resolve({ json: () => Promise.resolve(payload) }).then((r) => {
+        // Re-render the component that is currently mounted, so its state change
+        // takes effect — the card only builds its form once the payload arrives.
+        setTimeout(() => {
+          if (currentComponent) host = renderComponent(currentComponent);
+        }, 0);
+        return r;
+      });
     },
     setInterval: () => 1,
     clearInterval: (id) => { stoppedIntervals.push(id); },
@@ -190,7 +325,7 @@ await check('the client bundle applies cleanly against a fake loader', async () 
   // Rendering the chip must poll the state route AND announce the mount, because
   // the beacon is the host's only evidence that the client half is alive — a
   // route nobody calls would be dead code that only looks like observability.
-  assert.doesNotThrow(() => chip.component());
+  assert.doesNotThrow(() => renderComponent(chip.component));
   assert.ok(
     fetched.some((u) => u.startsWith('/dsh-effort/state.json')),
     `the chip must poll the published state, fetched: ${fetched.join(', ') || '(nothing)'}`,
@@ -202,11 +337,51 @@ await check('the client bundle applies cleanly against a fake loader', async () 
 
   // And the card must read the settings route, or it would render nothing while
   // looking like a working panel.
-  assert.doesNotThrow(() => card.component());
+  assert.doesNotThrow(() => renderComponent(card.component));
   assert.ok(
     fetched.some((u) => u.startsWith('/dsh-effort/config.json')),
     `the card must read the settings route, fetched: ${fetched.join(', ') || '(nothing)'}`,
   );
+
+  // Let the card's fetch resolve, which flips it from "loading" to the form.
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  host = renderComponent(card.component);
+  assert.ok(host, 'the card must render once its config has arrived');
+
+  /**
+   * Find the first element whose props carry an `onClick`.
+   *
+   * The card's save button is the first interactive control it renders, and the
+   * point is to drive the REAL click handler rather than to re-implement the
+   * payload logic here.
+   */
+  const findButton = (node) => {
+    if (!node || typeof node !== 'object') return null;
+    if (node.props && typeof node.props.onClick === 'function') return node;
+    for (const child of node.children || []) {
+      const found = findButton(child);
+      if (found) return found;
+    }
+    return null;
+  };
+
+  const saveButton = findButton(host);
+  assert.ok(saveButton, 'the card must render a clickable control');
+  assert.doesNotThrow(() => saveButton.props.onClick());
+  await new Promise((resolve) => setTimeout(resolve, 5));
+
+  const save = posted.filter((p) => p.url.startsWith('/dsh-effort/config.json')).pop();
+  assert.ok(save, `clicking save must POST the settings route, posted: ${JSON.stringify(posted)}`);
+  const values = save.body.values || {};
+  assert.equal(values.lowMax, CONFIG_FIXTURE.effective.lowMax, 'the live value must be sent');
+  assert.equal(
+    values.weights,
+    undefined,
+    'the payload must NOT include groups the host does not manage: posting them made every '
+    + 'successful save report a list of rejected keys',
+  );
+  assert.equal(values.semantic.provider, undefined, 'nor unexposed nested keys');
+  assert.ok(values.semantic.timeoutMs, 'but exposed nested keys must be sent');
 });
 
 console.log('loader contract');

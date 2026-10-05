@@ -62,7 +62,7 @@ test('load re-sanitises a hand-edited file', async () => {
 });
 
 test('sanitise keeps allowed keys and reports the rest', () => {
-  const { clean, rejected } = sanitise({
+  const { clean, rejected, ignored } = sanitise({
     lowMax: 3,
     highMin: 7,
     mode: 'local',
@@ -77,7 +77,39 @@ test('sanitise keeps allowed keys and reports the rest', () => {
     allowUpgrade: false,
     semantic: { timeoutMs: 1200 },
   });
-  assert.deepEqual(rejected.sort(), ['bogus', 'semantic.alsoBogus'], 'the nested rejection is qualified by its group');
+  assert.deepEqual(rejected, [], 'every supplied value was valid');
+  assert.deepEqual(ignored.sort(), ['bogus', 'semantic.alsoBogus']);
+});
+
+test('sanitise separates an invalid VALUE from an unmanaged KEY', () => {
+  // These are different facts and only one is the caller's problem. Conflating
+  // them made a SUCCESSFUL save report a wall of "rejected keys" — because the
+  // card posts the whole live config, which contains a group it does not own.
+  const { clean, rejected, ignored } = sanitise({
+    lowMax: 3,
+    highMin: 999,          // editable, value out of range -> rejected
+    weights: { x: 1 },     // group not managed at all   -> ignored
+    semantic: {
+      timeoutMs: 1200,     // editable, valid
+      provider: 'zhipu',   // nested key not exposed     -> ignored
+    },
+  });
+
+  assert.deepEqual(clean, { lowMax: 3, semantic: { timeoutMs: 1200 } });
+  assert.deepEqual(rejected, ['highMin'], "an invalid value IS the caller's problem");
+  assert.deepEqual(
+    ignored.sort(),
+    ['semantic.provider', 'weights'],
+    'an unmanaged key is NOT a rejection',
+  );
+});
+
+test('sanitise is completely silent for a caller posting only editable keys', () => {
+  // The steady state: the card sends exactly what the host says it accepts, so
+  // nothing is reported and the user never sees a spurious warning.
+  const { rejected, ignored } = sanitise({ lowMax: 3, semantic: { timeoutMs: 1200 } });
+  assert.deepEqual(rejected, []);
+  assert.deepEqual(ignored, []);
 });
 
 test('sanitise rejects out-of-range, non-integer and wrong-type values', () => {
@@ -99,10 +131,14 @@ test('sanitise rejects out-of-range, non-integer and wrong-type values', () => {
   }
 });
 
-test('sanitise rejects a nested group that is not an object', () => {
-  const { clean, rejected } = sanitise({ semantic: 5 });
+test('sanitise ignores a nested group that is not an object', () => {
+  // `semantic: 5` is a malformed SHAPE for a group, not a rejected value. It is
+  // dropped either way; classifying it as "ignored" keeps `rejected` meaning
+  // exactly "you sent a value I manage, and it was invalid".
+  const { clean, rejected, ignored } = sanitise({ semantic: 5 });
   assert.deepEqual(clean, {});
-  assert.deepEqual(rejected, ['semantic']);
+  assert.deepEqual(rejected, []);
+  assert.deepEqual(ignored, ['semantic']);
 });
 
 test('sanitise survives a non-object input', () => {
@@ -124,12 +160,26 @@ test('save writes atomically and leaves no temp files', async () => {
   });
 });
 
-test('save reports every rejected key so a UI typo is visible', async () => {
+test('save reports an invalid value and an unknown key differently', async () => {
   await withHome(() => {
-    const result = save({ lowMax: 3, wrong: 1, worse: 2 });
+    const result = save({ lowMax: 999, wrong: 1 });
     assert.equal(result.ok, true);
-    assert.deepEqual(result.rejected.sort(), ['worse', 'wrong']);
-    assert.deepEqual(load(), { lowMax: 3 }, 'only the valid key is stored');
+    // `lowMax` IS editable, so an out-of-range value is a mistake to surface.
+    assert.deepEqual(result.rejected, ['lowMax']);
+    // `wrong` was never editable, so it is not an error — reporting it as one is
+    // what made every successful save look like it had failed.
+    assert.deepEqual(result.ignored, ['wrong']);
+    assert.deepEqual(load(), {}, 'neither key may be stored');
+  });
+});
+
+test('save of only valid editable keys reports nothing at all', async () => {
+  await withHome(() => {
+    const result = save({ lowMax: 3 });
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.rejected, []);
+    assert.deepEqual(result.ignored, []);
+    assert.deepEqual(load(), { lowMax: 3 });
   });
 });
 
